@@ -1,14 +1,15 @@
-import face_recognition
-import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
-import os
+from deepface import DeepFace
 from PIL import Image
+import numpy as np
+import os
 from io import BytesIO
 import json
-from typing import Dict, List
+from typing import List, Dict
 from datetime import datetime
-from typing import List as TypeList
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 app = FastAPI()
 
@@ -16,8 +17,8 @@ class FaceRecognitionSystem:
     def __init__(self):
         self.reference_folder = "reference_images"
         self.metadata_file = "reference_metadata.json"
-        self.known_face_encodings: Dict[str, List[np.ndarray]] = {}
-        
+        self.known_faces = {}
+
         if not os.path.exists(self.reference_folder):
             os.makedirs(self.reference_folder)
         
@@ -25,8 +26,6 @@ class FaceRecognitionSystem:
 
     def load_reference_images(self):
         """Load and encode all reference images."""
-        self.known_face_encodings = {}
-        
         if os.path.exists(self.metadata_file):
             with open(self.metadata_file, 'r') as f:
                 metadata = json.load(f)
@@ -36,136 +35,84 @@ class FaceRecognitionSystem:
         for person_name in os.listdir(self.reference_folder):
             person_path = os.path.join(self.reference_folder, person_name)
             if os.path.isdir(person_path):
-                self.known_face_encodings[person_name] = []
-                
+                self.known_faces[person_name] = []
+
                 for img_file in os.listdir(person_path):
                     if img_file.endswith((".jpg", ".jpeg", ".png")):
                         img_path = os.path.join(person_path, img_file)
-                        
-                        image = face_recognition.load_image_file(img_path)
-                        face_encodings = face_recognition.face_encodings(image)
-                        
-                        if len(face_encodings) > 0:
-                            self.known_face_encodings[person_name].append(face_encodings[0])
+                        encoding = DeepFace.represent(img_path, model_name="Facenet", enforce_detection=False)
+                        self.known_faces[person_name].append(encoding)
 
-    async def process_image(self, image_data: bytes, person_folder: str) -> dict:
-        """Process a single image and return result."""
+    async def process_image(self, image_data: bytes, person_folder: str):
+        """Process and save a reference image."""
         try:
             image = Image.open(BytesIO(image_data))
-            
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            
+            image = image.convert('RGB')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             filename = f"{timestamp}.jpg"
             path = os.path.join(person_folder, filename)
             image.save(path)
-            
-            face_image = face_recognition.load_image_file(path)
-            face_encodings = face_recognition.face_encodings(face_image)
-            
-            if len(face_encodings) == 0:
-                os.remove(path)
-                return {
-                    "status": "error",
-                    "message": "No face detected in image",
-                    "filename": filename
-                }
-            
-            return {
-                "status": "success",
-                "message": "Face detected and encoded successfully",
-                "filename": filename,
-                "encoding": face_encodings[0]
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Error processing image: {str(e)}",
-                "filename": "unknown"
-            }
 
-    async def add_reference_images(self, files: TypeList[UploadFile], name: str):
-        """Add multiple reference images for a person."""
-        # Create person folder if it doesn't exist
+            encoding = DeepFace.represent(path, model_name="Facenet")
+            return {"status": "success", "encoding": encoding}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def add_reference_images(self, files: List[UploadFile], name: str):
         person_folder = os.path.join(self.reference_folder, name)
         if not os.path.exists(person_folder):
             os.makedirs(person_folder)
-        
-        results = []
-        successful_encodings = []
 
-        # Process each image
+        results = []
         for file in files:
             contents = await file.read()
             result = await self.process_image(contents, person_folder)
-            
             if result["status"] == "success":
-                successful_encodings.append(result["encoding"])
-            
-            results.append({
-                "filename": file.filename,
-                "status": result["status"],
-                "message": result["message"]
-            })
-
-        # Update encodings for the person
-        if name not in self.known_face_encodings:
-            self.known_face_encodings[name] = []
-        
-        self.known_face_encodings[name].extend(successful_encodings)
+                self.known_faces.setdefault(name, []).append(result["encoding"])
+            results.append({"filename": file.filename, "status": result["status"]})
 
         return {
             "message": f"Processed {len(files)} images for {name}",
-            "successful_uploads": len(successful_encodings),
-            "total_reference_images": len(self.known_face_encodings[name]),
             "results": results
         }
 
+    
+
     def identify_face(self, image_data):
-        """Identify faces in the given image with improved matching logic."""
-        face_locations = face_recognition.face_locations(image_data)
-        face_encodings = face_recognition.face_encodings(image_data, face_locations)
+        """Identify faces using the stored encodings."""
+        image = Image.open(BytesIO(image_data))
+        image = image.convert('RGB')
+        image_np = np.array(image)
         
+        # Get the embedding of the input image
+        detected_face = DeepFace.represent(img_path=image_np, model_name="Facenet", enforce_detection=False)
+        if not detected_face:
+            return [{"name": "Unknown", "confidence": 0}]
+        
+        input_encoding = detected_face[0]["embedding"]
         results = []
-        for face_encoding in face_encodings:
-            best_match = {"name": "Unknown", "confidence": 0.0}
-            
-            for person_name, person_encodings in self.known_face_encodings.items():
-                face_distances = face_recognition.face_distance(person_encodings, face_encoding)
-                
-                top_matches = sorted(face_distances)[:3]
-                avg_distance = np.mean(top_matches)
-                confidence = 1 - avg_distance
-                
-                if confidence > best_match["confidence"] and confidence > 0.6:
-                    best_match = {
-                        "name": person_name,
-                        "confidence": float(confidence),
-                        "reference_images_count": len(person_encodings)
-                    }
-            
-            results.append(best_match)
         
-        return results
+        # Compare input encoding with known face encodings
+        for name, encodings in self.known_faces.items():
+            for ref_encoding in encodings:
+                # Calculate cosine similarity
+                similarity = cosine_similarity([input_encoding], [ref_encoding])[0][0]
+                if similarity > 0.8:  # Adjust this threshold as needed for your use case
+                    results.append({"name": name, "confidence": similarity})
+                    break
+        
+        return results or [{"name": "Unknown", "confidence": 0}]
+
 
     def get_statistics(self):
-        """Get statistics about stored reference images."""
-        stats = {
-            "total_people": len(self.known_face_encodings),
-            "people": {
-                name: len(encodings) 
-                for name, encodings in self.known_face_encodings.items()
-            }
-        }
-        return stats
+        """Return stored image statistics."""
+        return {"total_people": len(self.known_faces), "people": {name: len(encodings) for name, encodings in self.known_faces.items()}}
 
 # Initialize the face recognition system
 face_system = FaceRecognitionSystem()
 
 @app.post("/add_reference")
-async def add_reference(files: TypeList[UploadFile] = File(...), name: str = Form(...)):
-    """Add multiple reference images with an associated name."""
+async def add_reference(files: List[UploadFile] = File(...), name: str = Form(...)):
     if not name:
         raise HTTPException(status_code=400, detail="Name is required")
     if not files:
@@ -174,22 +121,14 @@ async def add_reference(files: TypeList[UploadFile] = File(...), name: str = For
 
 @app.post("/identify")
 async def identify(file: UploadFile = File(...)):
-    """Identify faces in the uploaded image."""
     contents = await file.read()
-    image = Image.open(BytesIO(contents))
-    
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
-    
-    image_np = np.array(image)
-    results = face_system.identify_face(image_np)
+    results = face_system.identify_face(contents)
     return JSONResponse(content={"results": results})
 
 @app.get("/statistics")
 async def get_statistics():
-    """Get statistics about stored reference images."""
     return face_system.get_statistics()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8100)
